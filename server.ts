@@ -1,18 +1,27 @@
-import express from "express";
-import path from "path";
-import fs from "fs";
-import crypto from "crypto";
-import { renderAllCharts } from "./server/chartRenderer";
-import { renderHTMLToPDF } from "./server/pdfRenderer";
-import { buildPitchDeckHTML } from "./server/pitchDeckTemplate";
+import express from 'express';
+import path from 'path';
+import fs from 'fs';
+import crypto from 'crypto';
+import { renderAllCharts } from './server/chartRenderer';
+import { renderHTMLToPDF } from './server/pdfRenderer';
+import { buildPitchDeckHTML } from './server/pitchDeckTemplate';
 
 const app = express();
-const PORT = parseInt(process.env.PORT || "3000", 10);
-app.use(express.json({limit: '4mb'}));
+const PORT = parseInt(process.env.PORT || '3000', 10);
 
-const DATA_DIR = path.join(process.cwd(), "data");
+// We need both JSON and raw body (for Paystack webhook signature validation)
+app.use((req, res, next) => {
+  // small middleware to capture raw body for webhook route
+  let data = '';
+  req.on('data', chunk => { data += chunk; });
+  req.on('end', () => { (req as any).rawBody = data; });
+  next();
+});
+app.use(express.json({ limit: '6mb' }));
+
+const DATA_DIR = path.join(process.cwd(), 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
-const USERS_FILE = path.join(DATA_DIR, "users.json");
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
 
 function loadUsers(){ if (!fs.existsSync(USERS_FILE)) return []; try { return JSON.parse(fs.readFileSync(USERS_FILE,'utf-8')); } catch { return []; } }
 function saveUsers(u:any[]){ fs.writeFileSync(USERS_FILE, JSON.stringify(u,null,2),'utf-8'); }
@@ -38,7 +47,7 @@ app.post('/api/auth/login', (req,res)=>{
   res.json({ success: true, user: { id: u.id, email: u.email, name: u.name, isUnlocked: !!u.isUnlocked } });
 });
 
-// Payment init/verify
+// Payment init/verify using Paystack API (test keys ok)
 const PAYSTACK_PUBLIC = process.env.PAYSTACK_PUBLIC_KEY || '';
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY || '';
 
@@ -52,10 +61,62 @@ app.post('/api/payment/initialize', (req,res)=>{
 app.post('/api/payment/verify', async (req,res)=>{
   const { reference, userId, tier } = req.body;
   if (!reference || !userId) return res.status(400).json({ error: 'missing' });
-  if (!reference.startsWith('RM-')) return res.status(400).json({ success:false });
-  const users = loadUsers(); const u = users.find((x:any)=>x.id===userId);
-  if (u) { if (tier === 'lifetime') u.isUnlocked = true; if (tier === 'design') u.isDesignStudioUnlocked = true; if (tier === 'iwrite') u.isIWriteProUnlocked = true; u.paymentRef = reference; saveUsers(users); }
-  res.json({ success: true, tier });
+  try {
+    if (!PAYSTACK_SECRET) {
+      // Fallback to simulated verify for dev when secret not present
+      if (!reference.startsWith('RM-')) return res.status(400).json({ success:false });
+      const users = loadUsers(); const u = users.find((x:any)=>x.id===userId);
+      if (u) { if (tier === 'lifetime') u.isUnlocked = true; if (tier === 'design') u.isDesignStudioUnlocked = true; if (tier === 'iwrite') u.isIWriteProUnlocked = true; u.paymentRef = reference; saveUsers(users); }
+      return res.json({ success: true, tier, simulated: true });
+    }
+
+    // Verify with Paystack API
+    const resp = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` } });
+    const data = await resp.json();
+    if (data.status && data.data && data.data.status === 'success'){
+      // If metadata contains userId/tier prefer that, otherwise use provided
+      const metadata = data.data.metadata || {};
+      const uid = metadata.userId || userId;
+      const tr = metadata.tier || tier;
+      const users = loadUsers(); const u = users.find((x:any)=>x.id===uid);
+      if (u) {
+        if (tr === 'lifetime') u.isUnlocked = true;
+        if (tr === 'design') u.isDesignStudioUnlocked = true;
+        if (tr === 'iwrite') u.isIWriteProUnlocked = true;
+        u.paymentRef = reference; u.paymentDate = new Date().toISOString();
+        saveUsers(users);
+      }
+      return res.json({ success: true, tier: tr, data });
+    }
+    return res.status(400).json({ success: false, data });
+  } catch (err:any) { console.error('Paystack verify error', err); res.status(500).json({ error: err.message }); }
+});
+
+// Paystack webhook receiver with HMAC verification
+app.post('/api/payment/webhook', express.raw({ type: 'application/json' }), (req:any, res:any) => {
+  const raw = req.body; // Buffer
+  try {
+    const signature = req.headers['x-paystack-signature'] as string;
+    if (PAYSTACK_SECRET) {
+      const hmac = crypto.createHmac('sha512', PAYSTACK_SECRET).update(raw).digest('hex');
+      if (hmac !== signature) { console.warn('Invalid webhook signature'); return res.status(401).send('invalid signature'); }
+    }
+    const event = JSON.parse(raw.toString());
+    if (event.event === 'charge.success'){
+      const { metadata, reference } = event.data || {};
+      const { userId, tier } = metadata || {};
+      if (userId) {
+        const users = loadUsers(); const u = users.find((x:any)=>x.id===userId);
+        if (u) {
+          if (tier === 'lifetime') u.isUnlocked = true;
+          if (tier === 'design') u.isDesignStudioUnlocked = true;
+          if (tier === 'iwrite') u.isIWriteProUnlocked = true;
+          u.paymentRef = reference; u.paymentDate = new Date().toISOString(); saveUsers(users);
+        }
+      }
+    }
+    res.sendStatus(200);
+  } catch (err:any) { console.error('webhook error', err); res.status(500).send('error'); }
 });
 
 // Pitch PDF generation endpoint
@@ -89,8 +150,8 @@ app.post('/api/cover/export', async (req,res)=>{
   if (!html) return res.status(400).json({ error: 'missing html' });
   try {
     const pdf = await renderHTMLToPDF(html);
-    res.setHeader('Content-Type','image/png');
-    res.setHeader('Content-Disposition','attachment; filename="cover.png"');
+    res.setHeader('Content-Type','application/pdf');
+    res.setHeader('Content-Disposition','attachment; filename="cover.pdf"');
     res.send(pdf);
   } catch (err:any) { res.status(500).json({ error: err.message }); }
 });

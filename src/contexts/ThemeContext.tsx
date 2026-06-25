@@ -1,12 +1,32 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 
-type ThemeContextValue = { theme: string; setTheme: (t:string)=>void };
-const ThemeContext = createContext<ThemeContextValue>({ theme: 'futuristic', setTheme: ()=>{} });
+type ThemeName = 'futuristic' | 'warm';
 
-export function ThemeProvider({ children }:{children:React.ReactNode}){
-  const [theme, setTheme] = useState<string>(()=>localStorage.getItem('rptheme')||'futuristic');
-  useEffect(()=>{ localStorage.setItem('rptheme', theme); document.documentElement.setAttribute('data-theme', theme); },[theme]);
-  return <ThemeContext.Provider value={{theme,setTheme}}>{children}</ThemeContext.Provider>
+type ThemeContextValue = {
+  theme: ThemeName;
+  setTheme: (t: ThemeName) => void;
+  bright: boolean;
+  setBright: (b: boolean) => void;
+};
+
+const ThemeContext = createContext<ThemeContextValue>({ theme: 'futuristic', setTheme: () => {}, bright: false, setBright: () => {} });
+
+export function ThemeProvider({ children }: { children: React.ReactNode }) {
+  const [theme, setTheme] = useState<ThemeName>(() => (localStorage.getItem('rptheme') as ThemeName) || 'futuristic');
+  const [bright, setBright] = useState<boolean>(() => localStorage.getItem('rpbright') === 'true');
+
+  useEffect(() => {
+    localStorage.setItem('rptheme', theme);
+    localStorage.setItem('rpbright', String(bright));
+    document.documentElement.setAttribute('data-theme', theme);
+    document.documentElement.setAttribute('data-bright', String(bright));
+  }, [theme, bright]);
+
+  return <ThemeContext.Provider value={{ theme, setTheme, bright, setBright }}>{children}</ThemeContext.Provider>;
 }
-export function useTheme(){ return useContext(ThemeContext); }
+
+export function useTheme() {
+  return useContext(ThemeContext);
+}
+
 export default ThemeContext;
